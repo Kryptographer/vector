@@ -208,7 +208,7 @@ does to each result.
 
 | | fold off | **fold on** | read-back only |
 |---|---:|---:|---:|
-| peak active context | 824,270 | **5,251** | 212,422 |
+| peak active context | 824,270 | **5,251** | 211,538 |
 | cumulative prefill | 3,313,226 | **33,301** | 4,780,994 |
 | round trips | 6 | **9** | 49 |
 | retrieval answers | 4/4 | **4/4** | 4/4 |
@@ -293,6 +293,29 @@ Everything is `sqlite3`, `re` and `pathlib` from the standard library.
 
 `pytest` is optional and only for running the test suite under pytest; the same
 suite runs standalone with no dependencies at all.
+
+### Store size
+
+Measured on this machine, writing facts of six scoring tokens each, so treat
+them as shape rather than as your numbers:
+
+| facts in store | per `remember` | full ingest | per `recall` |
+|---:|---:|---:|---:|
+| 500 | 2.1 ms | 1.0 s | 3.4 ms |
+| 2,000 | 2.2 ms | 4.4 s | 10.4 ms |
+| 5,000 | 3.0 ms | 15.0 s | 29.4 ms |
+| 10,000 | 4.3 ms | 42.8 s | 55.5 ms |
+
+**Writes stay roughly flat.** A write compares the incoming fact against
+stored ones, and the comparison is narrowed by a token index rather than run
+over the table, so the cost tracks how many facts could actually merge instead
+of how many exist. See [docs/MEMORY.md](docs/MEMORY.md#the-dedup-index).
+
+**Recall is linear in the store, by design.** It scores every fact, which is
+what makes the ranking explainable and what keeps the whole thing dependency
+free. At a few thousand facts that is single-digit to low-tens of milliseconds
+and invisible beside a model call; it is not the design to reach for if you
+intend to hold hundreds of thousands.
 
 ---
 

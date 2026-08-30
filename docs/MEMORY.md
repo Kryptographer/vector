@@ -233,6 +233,53 @@ demotes every first write in a fresh store.
 
 ---
 
+### The dedup index
+
+The comparison above is between the incoming fact and a stored one, and the
+obvious way to run it is over every stored fact. That is what it used to do:
+it selected the whole table and re-tokenised every sentence on it, on every
+single write. Linear per write is quadratic over a session's writes, and it
+showed — 4.7 ms per write into a 500-fact store, 17.8 ms into a 2,000-fact
+one, and a 5,000-fact ingest that did not finish inside seventy seconds. The
+first thing anyone does with a memory layer is pour their notes into it, which
+was precisely the shape that fell over.
+
+What fixes it is that none of the three merge paths can fire on an arbitrary
+row. Writing `a` for the incoming fact's token count, `b` for the stored
+fact's and `c` for the overlap:
+
+| path | condition | what it needs of the stored row |
+|---|---|---|
+| ratio | `c / (a + b - c) > 0.75` | `7c > 3(a+b)`, and `b >= c`, so **`4c > 3a`** |
+| `_restates` | `new ⊂ old` | `c = a`, which clears the same bar |
+| `_elaborates` | `old ⊂ new`, inside the window | every one of its tokens in the incoming set |
+
+So the ratio arm needs a row carrying **more than three quarters of the
+incoming fact's tokens**, whatever its own length, and that is a counting
+question a token index answers. The `fact_tokens` table holds one row per
+`(token, fact)` pair, and `memories.token_count` holds each fact's own total,
+which is what makes "all of its tokens are in this set" a comparison between
+two counts rather than a second aggregate.
+
+Both bounds are **necessary conditions, not heuristics**: a row the index
+leaves out could not have merged, so the narrowed pass reaches exactly the row
+an unrestricted scan would have. `tests/selftest.py` asserts that equivalence
+directly rather than trusting the algebra, and the index is rebuilt on first
+open for a store written before it existed.
+
+Two things about the shape of this are worth stating, because they are the
+part that was got wrong twice before it was got right. Narrowing to rows that
+share **one** token does nothing on natural language — with any shared
+vocabulary almost every row shares one, and a single common word outside the
+stop list puts the whole store back in the candidate set. And the
+`_elaborates` window is not a filter on its own either: during a bulk import
+every fact was written in the last hour, so a date range returns everything.
+Only the counting bounds actually narrow.
+
+Writes are roughly flat across store size as a result; recall is still linear,
+because it scores every fact on purpose. Numbers in the
+[README](../README.md#store-size).
+
 ## Semantic recall
 
 None is bundled and the seam is empty by default. Register a backend and its hits
