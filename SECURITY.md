@@ -3,7 +3,7 @@
 ## Reporting a vulnerability
 
 Please report security issues privately through
-[GitHub's private vulnerability reporting](https://github.com/kryptographer/ranger/security/advisories/new)
+[GitHub's private vulnerability reporting](https://github.com/Kryptographer/vector/security/advisories/new)
 rather than opening a public issue.
 
 Include what you can: the version, a reproduction, and what an attacker would
