@@ -1,0 +1,18 @@
+__pycache__/
+*.py[cod]
+*.egg-info/
+build/
+dist/
+.venv/
+venv/
+.pytest_cache/
+.ruff_cache/
+
+# Benchmark output. Regenerate it with `python bench/report.py`; a committed
+# report is a number from somebody else's machine wearing yours.
+bench-results/
+
+# Local state a run may leave behind.
+*.db
+*.db-wal
+*.db-shm

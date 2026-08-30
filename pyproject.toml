@@ -1,0 +1,50 @@
+[build-system]
+requires = ["setuptools>=61"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "rangerkit"
+version = "1.0.0"
+description = "Cross-session memory and context folding for local agents. SQLite and the standard library, nothing else."
+readme = "README.md"
+requires-python = ">=3.10"
+license = { file = "LICENSE" }
+authors = [{ name = "Kryptographer" }]
+keywords = [
+    "agent", "memory", "context", "llm", "sqlite", "retrieval",
+    "context-compression", "local-first", "tool-use",
+]
+classifiers = [
+    "Development Status :: 5 - Production/Stable",
+    "Intended Audience :: Developers",
+    "License :: OSI Approved :: Apache Software License",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
+    "Topic :: Software Development :: Libraries :: Python Modules",
+    "Topic :: Scientific/Engineering :: Artificial Intelligence",
+    "Typing :: Typed",
+]
+
+# No runtime dependencies, and that is a design constraint rather than an
+# accident -- see the Requirements section of the README. Everything here is
+# `sqlite3`, `re` and `pathlib` from the standard library.
+dependencies = []
+
+[project.optional-dependencies]
+# Only for running the test suite under pytest. The suite also runs standalone
+# with `python tests/selftest.py`, which needs nothing at all.
+dev = ["pytest>=7"]
+
+[project.urls]
+Homepage = "https://github.com/kryptographer/ranger"
+Source = "https://github.com/kryptographer/ranger"
+Issues = "https://github.com/kryptographer/ranger/issues"
+
+[tool.setuptools.packages.find]
+include = ["rangerkit*"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]

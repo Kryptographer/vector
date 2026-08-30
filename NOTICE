@@ -1,0 +1,13 @@
+Ranger Kit
+Copyright 2026 Kryptographer
+
+This product is licensed under the Apache License, Version 2.0.
+You may obtain a copy of the License in the LICENSE file distributed with
+this product, or at http://www.apache.org/licenses/LICENSE-2.0
+
+Ranger Kit contains no third-party source code and has no runtime
+dependencies. Everything in this repository is original work.
+
+The design of the read-back budget and the chunked-recall bound in
+rangerkit/fold/gate.py follows ARC (arXiv:2607.25066); the citation is in the
+source at each point the idea is used. No ARC code is included.
