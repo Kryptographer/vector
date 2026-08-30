@@ -1,6 +1,8 @@
 <div align="center">
 
-<img src="assets/ranger-icon.png" alt="Ranger" width="360">
+<img src="assets/ranger-vector.png" alt="Ranger: Vector" width="300">
+
+# Ranger: Vector
 
 **Cross-session memory and context folding for local agents.**
 SQLite and the standard library. No embedding model, no vector store, no network.
@@ -18,10 +20,10 @@ SQLite and the standard library. No embedding model, no vector store, no network
 ## What it is
 
 Two mechanisms an agent needs and most agent frameworks do not have, extracted
-from [Ranger](https://github.com/kryptographer/ranger) and packaged to stand on
-their own. One idea connects them: **an agent's useful context is far larger
-than the window it is allowed to think in, and both halves of that gap can be
-closed on the machine rather than in the prompt.**
+from **Ranger**, a local-first desktop agent that is [not public yet](#about),
+and packaged to stand on their own. One idea connects them: **an agent's useful
+context is far larger than the window it is allowed to think in, and both halves
+of that gap can be closed on the machine rather than in the prompt.**
 
 **`rangerkit.memory` — what survives the session.** Facts written by the agent
 or the user, stored in SQLite, ranked by keyword overlap and a spread of related
@@ -44,23 +46,31 @@ what it costs, including the case the fold loses.
 
 Nothing here reaches the network, loads a model, or requires one to be running.
 
+> **Before you rely on any of it:** the app these came out of is not publicly
+> available at the moment, and I am not a specialist in this field. Both of
+> those change how you should read what follows. [About](#about) says why, in
+> plain terms.
+
 ---
 
 ## Install
 
-```bash
-pip install rangerkit
-```
-
-Or from source, which is also how you get the benchmarks and examples:
+Not on PyPI yet. Install from source, which is also how you get the benchmarks
+and the examples:
 
 ```bash
-git clone https://github.com/kryptographer/ranger.git
-cd "ranger/Ranger Release Repo"
+git clone https://github.com/Kryptographer/vector.git
+cd vector
 pip install -e .
 ```
 
-There is nothing else to install. See [Requirements](#requirements).
+There is nothing else to install. See [Requirements](#requirements). The import
+name is `rangerkit`:
+
+```python
+from rangerkit import memory
+from rangerkit.fold import gate, ledger
+```
 
 ---
 
@@ -315,7 +325,45 @@ Apache-2.0. See [LICENSE](LICENSE) and [NOTICE](NOTICE).
 
 ## About
 
-Extracted from [Ranger](https://github.com/kryptographer/ranger), a local-first
-desktop agent, and released on its own because these two mechanisms are useful
-well outside it. The app is not included here and is not needed — this is the
-memory layer, the fold, and the harnesses that measure them.
+### What Ranger is, and why this is separate from it
+
+**Ranger** is a local-first desktop AI assistant. It runs a chat and tool-use
+agent against a model on your own machine: it reads and writes files, runs
+commands, keeps its database on that machine, and works with the network off.
+Its tagline is the whole design: *AI assistant. Local. Private. Offline.*
+Carrying what it learns from one session into the next, and working with tool
+results far larger than its context window, are things it has to do to be worth
+using at all.
+
+**Ranger itself is not publicly available at the moment.** This repository is
+not the app, and you do not need the app for any of it.
+
+What is here are the two mechanisms it needed most, and that I could not find
+anywhere else in a form that did not want a vector database and a second model
+resident in VRAM. Inside the app the read-back tools are named `vector_peek`,
+`vector_grep` and `vector_stats`, which is where the name of this repository
+comes from. They are pulled out, documented, benchmarked, and released on their
+own because they seem genuinely useful outside Ranger: worth other engineers
+testing against their own agents, measuring against something better, breaking,
+and improving. That is a better use for them than sitting inside an app nobody
+can install yet.
+
+### How this was built, honestly
+
+I do not have a strong fundamental grounding in this field, meaning information
+retrieval, memory systems, model internals. A lot of this was patchworked
+together with Claude, from ideas I had and was able to get working, then pushed
+on until the numbers moved.
+
+I am stating that plainly because it should change how you read everything
+above. The mechanisms are real and the measurements are real: deterministic,
+no model, no network, one command, and you can run them yourself. But *"it
+works, and here are the numbers"* is not the same claim as *"this is the right
+way to do it."* I am not in a position to tell you which parts here are
+ordinary practice, which are reinvented with a worse name, and which are simply
+wrong in a way I cannot see from where I am standing.
+
+Which is most of the reason it is public. If you do know this field, the bounds
+argued in [docs/MEMORY.md](docs/MEMORY.md), and the losing case priced in the
+fold benchmark, are the places to push hardest. Issues, corrections and
+replacements are all welcome, blunt ones included.
