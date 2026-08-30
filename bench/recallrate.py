@@ -12,6 +12,11 @@ Method, stated so the number can be discounted properly:
 
 The bias that remains: one author wrote both halves. Treat this as an
 indication, not a measurement of anyone's real store.
+
+The persona below is invented. It is written in the register a real store
+accumulates facts in, because that is what the bench is measuring, but no
+name, code, date or number in it belongs to anybody. Nothing here was
+transcribed from a real store, and nothing here should be read as if it was.
 """
 import sys
 import tempfile
@@ -38,13 +43,13 @@ FACTS = [
     "Their dog Biscuit is a border collie who needs two walks a day",
     "The vet appointment for Biscuit is the first Tuesday of each month",
     "Dave's mother lives in Leeds and visits at Christmas",
-    "The house alarm code is 8823",
-    "The garage door code is 4417",
+    "The house alarm code is 1234",
+    "The garage door code is 5678",
     "Bin collection is Thursday mornings",
     "The boiler was serviced in October and is due again next October",
-    "Dave's car is a 2018 Volvo V60 with 74,000 miles on it",
-    "The Volvo needs its timing belt done before 100,000 miles",
-    "Dave's mortgage is with Nationwide on a five year fix ending in 2027",
+    "Dave's car is a 2015 Skoda Octavia with 62,000 miles on it",
+    "The Octavia needs its timing belt done before 100,000 miles",
+    "Dave's mortgage is with Ashcombe on a five year fix ending in 2027",
     "Dave plays bass and records in Reaper with a Scarlett interface",
     "The bass is a Fender Precision from 1996",
     "Dave mixes with Ozone and prints stems at 48 kHz",
@@ -53,10 +58,10 @@ FACTS = [
     "Dave is trying to cut down to two coffees a day",
     "The gym membership is at PureGym and renews in January",
     "Dave swims on Mondays and lifts on Wednesdays and Fridays",
-    "Dave's passport expires in August 2028",
+    "Dave's passport expires in March 2031",
     "The flight to Lisbon is on the 3rd of June from Gatwick",
     "Dave gets motion sick on boats and takes tablets beforehand",
-    "The spare house key is with the neighbour at number 14",
+    "The spare house key is with the neighbour across the road",
     "Dave's accountant is Marcus at Hedley and Cole",
     "The tax return is due at the end of January every year",
     "Dave invoices clients on the last working day of the month",
