@@ -24,7 +24,7 @@ import re
 import sqlite3
 import threading
 import uuid
-from datetime import datetime
+from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Any
 
@@ -418,8 +418,24 @@ def _prepare(conn: sqlite3.Connection) -> sqlite3.Connection:
         # and inventing one would be worse than knowing of none.
         if "grafted" not in cols:
             conn.execute("ALTER TABLE memories ADD COLUMN grafted TEXT NOT NULL DEFAULT ''")
+        # ...and how many scoring tokens the fact itself has. Denormalised from
+        # `fact_tokens` on purpose: the dedup pass has to ask whether a stored
+        # fact's tokens are ALL present in an incoming one, which is a
+        # comparison between a row's match count and its own total, and
+        # without the total on the row that second number costs an aggregate
+        # over every row that shares so much as one common word. Written by
+        # `_index_tokens` alongside the token rows, so the two cannot drift.
+        if "token_count" not in cols:
+            conn.execute(
+                "ALTER TABLE memories ADD COLUMN token_count INTEGER NOT NULL DEFAULT 0")
+            _needs_token_backfill = True
+        else:
+            _needs_token_backfill = False
         # Routed recall and the core digest both select on folder.
         conn.execute("CREATE INDEX IF NOT EXISTS idx_memories_folder ON memories(folder)")
+        # The dedup pass fetches the rows still inside `_elaborates`' window by
+        # date, which is a range scan over a monotonic column.
+        conn.execute("CREATE INDEX IF NOT EXISTS idx_memories_created ON memories(created_at)")
         # Scattershot's learned bonds: which words led to which fact in a turn
         # that then worked. A separate table rather than columns on `memories`
         # because the relation is many-to-many and it is pruned on its own
@@ -439,6 +455,44 @@ def _prepare(conn: sqlite3.Connection) -> sqlite3.Connection:
         )
         # Deleting a fact deletes its bonds, and that lookup is by id.
         conn.execute("CREATE INDEX IF NOT EXISTS idx_bonds_mem ON bonds(mem_id)")
+        # Which facts contain which scoring token. The dedup pass in `remember`
+        # compares an incoming fact against stored ones, and every path it can
+        # merge on needs the two to share at least one token -- so this is the
+        # index that says which rows those are, and the pass reads only those.
+        #
+        # Without it that pass selected the whole table and re-tokenised every
+        # stored fact on every single write, which is linear per write and so
+        # quadratic across a session's writes. Measured before this existed:
+        # 4.7 ms per write into a 500-fact store, 17.8 ms into a 2,000-fact
+        # one, and an ingest of 5,000 that did not finish inside 70 seconds.
+        #
+        # Derived data, exactly like `bonds` above: it holds nothing the
+        # `memories` table does not, so dropping it costs a rebuild and
+        # nothing else. The composite primary key IS the lookup index, and
+        # `WITHOUT ROWID` keeps the pair stored once rather than beside a
+        # rowid it would never be read by.
+        had_tokens = conn.execute(
+            "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'fact_tokens'"
+        ).fetchone() is not None
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS fact_tokens (
+                token  TEXT NOT NULL,
+                mem_id INTEGER NOT NULL,
+                PRIMARY KEY (token, mem_id)
+            ) WITHOUT ROWID
+            """
+        )
+        # Deleting a fact deletes its tokens, and that lookup is by id.
+        conn.execute("CREATE INDEX IF NOT EXISTS idx_fact_tokens_mem ON fact_tokens(mem_id)")
+        if not had_tokens or _needs_token_backfill:
+            # One-time backfill for a database written before the index
+            # existed: the rows are recomputed from the facts already on disk,
+            # with the same `_tokens` the lookup uses, so an upgraded store
+            # dedups exactly as a fresh one does. Runs on the first open after
+            # the upgrade and never again.
+            for _rid, _text in conn.execute("SELECT id, fact FROM memories").fetchall():
+                _index_tokens(conn, _rid, _text)
         try:
             conn.execute("PRAGMA journal_mode=WAL")
         except sqlite3.Error:
@@ -627,7 +681,8 @@ def _cue_note(fact: str) -> str:
 _ELABORATE_WINDOW_S = 3600.0
 
 
-def _elaborates(new_tokens: set[str], old_fact: str, old_stamp: Any = None) -> bool:
+def _elaborates(new_tokens: set[str], old_fact: str, old_stamp: Any = None,
+                old_tokens: set[str] | None = None) -> bool:
     """True when a new fact is the same claim as `old_fact`, finally said properly.
 
     Without this, the note above is advice that makes the store worse. The
@@ -676,10 +731,24 @@ def _elaborates(new_tokens: set[str], old_fact: str, old_stamp: Any = None) -> b
     """
     if not _CUE_CHECK:
         return False
-    old_tokens = _tokens(old_fact)
-    if not old_tokens or not _cue_gap(old_fact):
-        return False
+    # The window gate goes first because it is both the cheapest test here and
+    # by far the most selective. Every other gate below tokenises `old_fact`
+    # -- `_cue_gap` does it a second time -- and this one is a timestamp
+    # subtraction, while an hour-wide window means almost every row in a store
+    # of any age fails it. Running it last meant re-tokenising the whole
+    # candidate set on every write to answer a question a date comparison had
+    # already settled: measured at three `_tokens` calls per stored fact per
+    # write, which was the real cost of this pass and not the scan it sits in.
+    #
+    # Order only. The set of facts this returns True for does not move: a row
+    # outside the window was rejected before and is rejected now, and a row
+    # with no scoring tokens still falls to the emptiness check below.
     if old_stamp is not None and _age_seconds(old_stamp) > _ELABORATE_WINDOW_S:
+        return False
+    # The caller has usually tokenised this row already for the ratio arm.
+    if old_tokens is None:
+        old_tokens = _tokens(old_fact)
+    if not old_tokens or not _cue_gap(old_fact):
         return False
     return old_tokens < new_tokens  # proper subset: contained, and adds at least one
 
@@ -1483,6 +1552,134 @@ def _clean_folder(folder: Any) -> str:
     return "/".join(parts[:3])
 
 
+# SQLite's compiled-in parameter ceiling is 999 on builds predating 3.32, so
+# every generated `IN` clause below is paged well under it rather than assuming
+# whichever sqlite3 the host Python was linked against.
+_SQL_VARS = 400
+
+
+def _index_tokens(conn: Any, mem_id: Any, fact: str) -> None:
+    """Rewrite the `fact_tokens` rows for one fact. The caller commits.
+
+    Called on every write that changes a fact's TEXT, and only those: the
+    tally, folder, lineage and held-flag updates elsewhere cannot change which
+    tokens a fact contains, so they leave the index alone.
+    """
+    conn.execute("DELETE FROM fact_tokens WHERE mem_id = ?", (int(mem_id),))
+    toks = _tokens(fact)
+    conn.execute("UPDATE memories SET token_count = ? WHERE id = ?",
+                 (len(toks), int(mem_id)))
+    if toks:
+        conn.executemany(
+            "INSERT INTO fact_tokens (token, mem_id) VALUES (?, ?)",
+            [(t, int(mem_id)) for t in toks],
+        )
+
+
+def _candidate_rows(conn: Any, new_tokens: set[str],
+                    cue_window_from: str | None) -> list[tuple]:
+    """The stored rows an incoming fact could possibly merge with.
+
+    This NARROWS the dedup loop; it does not filter it. Each of the three
+    merge paths has a necessary condition that can be answered from the token
+    index instead of by reading and re-tokenising every fact on disk.
+
+    The ratio arm fires on Jaccard > 0.75. Writing `a` for the incoming
+    fact's token count, `b` for the stored one's and `c` for the overlap::
+
+        c / (a + b - c) > 3/4   =>   7c > 3(a + b)
+
+    and since `b >= c` always, that gives `4c > 3a`: a row has to share more
+    than three quarters of the INCOMING fact's tokens, whatever its own
+    length. In integers the smallest overlap that can still qualify is
+    `(3a)//4 + 1`, which is what the `HAVING` below counts to. Sharing merely
+    ONE token is not a useful test on natural language -- with any shared
+    vocabulary almost every row shares one, which is how the first version of
+    this narrowed a 2,000-fact store down to about 1,400 candidates and saved
+    nothing.
+
+    `_restates` needs `new < old`, so `c = a`, which clears the same bar for
+    every `a >= 1` and needs no separate arm.
+
+    `_elaborates` does need one. It fires on `old < new`, so `c = b`, and a
+    short stored fact can be a subset of a long new one while sharing far
+    fewer than three quarters of its tokens. What bounds it instead is time:
+    the path is only open inside `_ELABORATE_WINDOW_S` of the stored fact
+    being written, so the rows that can take it are exactly the recent ones,
+    and `cue_window_from` fetches them by date. Passing None (the cue check
+    is off, so `_elaborates` is dead) drops the arm entirely.
+
+    Rows come back in id order, which is the order the unrestricted table scan
+    returned them in. That ordering is load-bearing rather than tidy: the loop
+    returns on its FIRST match, so reordering it would change which row a
+    fact merges into.
+    """
+    if not new_tokens:
+        # No scoring tokens means no overlap with anything, and both subset
+        # arms require a non-empty set on the side that is contained. The loop
+        # this skips would have `continue`d on every row it was given.
+        return []
+    toks = sorted(new_tokens)
+    need = (3 * len(toks)) // 4 + 1
+    marks = ",".join("?" * len(toks))
+    ids: set[int] = set()
+
+    if len(toks) <= _SQL_VARS - 4:
+        # The ratio arm: a row has to carry more than three quarters of the
+        # incoming fact's tokens. Counted in SQL so only the rows that clear
+        # the bar come back -- filtering in Python instead meant shipping one
+        # row per fact sharing ANY word, and a single common word that the
+        # stop list does not cover puts the whole store in that set.
+        ids.update(row[0] for row in conn.execute(
+            "SELECT mem_id FROM fact_tokens WHERE token IN "
+            f"({marks}) GROUP BY mem_id HAVING COUNT(*) >= ?", (*toks, need)))
+        if cue_window_from is not None:
+            # The `_elaborates` arm: every token of the stored fact present in
+            # the incoming one, at least one token fewer, and written inside
+            # the window. "All of its tokens are in this set" is the row's
+            # match count reaching its own total, which is why the total sits
+            # on the row -- otherwise establishing it costs an aggregate over
+            # every row sharing a common word, which is the whole store again.
+            ids.update(row[0] for row in conn.execute(
+                "SELECT ft.mem_id FROM fact_tokens ft "
+                "JOIN memories mm ON mm.id = ft.mem_id "
+                "WHERE mm.created_at >= ? AND mm.token_count > 0 "
+                f"AND mm.token_count < ? AND ft.token IN ({marks}) "
+                "GROUP BY ft.mem_id HAVING COUNT(*) = mm.token_count",
+                (cue_window_from, len(toks), *toks)))
+    else:
+        # More tokens than one statement can bind them all twice over. Page
+        # the overlap count and sum it here instead -- a `HAVING` per page
+        # would count a fraction of the overlap and discard rows that clear
+        # the bar on the total -- and fall back to the date range on its own
+        # for the window arm. Still exact, just less selective, and a fact
+        # with hundreds of distinct scoring words is not the common case.
+        counts: dict[int, int] = {}
+        for i in range(0, len(toks), _SQL_VARS):
+            part = toks[i:i + _SQL_VARS]
+            for mem_id, hits in conn.execute(
+                "SELECT mem_id, COUNT(*) FROM fact_tokens WHERE token IN "
+                f"({','.join('?' * len(part))}) GROUP BY mem_id", part
+            ):
+                counts[mem_id] = counts.get(mem_id, 0) + hits
+        ids.update(mem_id for mem_id, hits in counts.items() if hits >= need)
+        if cue_window_from is not None:
+            ids.update(row[0] for row in conn.execute(
+                "SELECT id FROM memories WHERE created_at >= ?", (cue_window_from,)))
+
+    if not ids:
+        return []
+    rows: list[tuple] = []
+    ordered = sorted(ids)
+    for i in range(0, len(ordered), _SQL_VARS):
+        part = ordered[i:i + _SQL_VARS]
+        rows.extend(conn.execute(
+            "SELECT id, fact, created_at, lineage, uses, wins, unproven, grafted "
+            f"FROM memories WHERE id IN ({','.join('?' * len(part))})", part))
+    rows.sort(key=lambda row: row[0])
+    return rows
+
+
 @registry.tool(
     name="remember",
     description=(
@@ -1523,10 +1720,6 @@ def remember(fact: str, category: str = "fact", context: str = "") -> str:
         category = "fact"
 
     conn = _connect()
-    # Avoid piling up near-duplicates of the same fact.
-    existing = conn.execute(
-        "SELECT id, fact, created_at, lineage, uses, wins, unproven, grafted "
-        "FROM memories").fetchall()
     new_tokens = _tokens(fact)
     stamp = datetime.now().isoformat(timespec="seconds")
     # Where this write is coming from, traced stem to branch to tree. Computed
@@ -1539,7 +1732,38 @@ def remember(fact: str, category: str = "fact", context: str = "") -> str:
     # the day the knob went back on, which is the one moment the history would
     # have been worth having.
     new_lineage = _lineage()
-    standing = _standing([r[3:] for r in existing]) if _PROVENANCE else {}
+    # Standing is a property of the WHOLE store -- how each tree's facts have
+    # fared, everywhere -- so reading it means reading every row. It is also
+    # needed only on the rare write that takes a row over from another tree,
+    # so it is read on demand rather than up front: computing it eagerly cost
+    # a full-store pass on every write to answer a question almost no write
+    # asks. Cached per call because the loop returns on its first match, so
+    # this can be reached at most once.
+    standing: dict[str, float] | None = None
+
+    def _tree_standing() -> dict[str, float]:
+        nonlocal standing
+        if standing is None:
+            standing = _standing(
+                conn.execute(
+                    "SELECT lineage, uses, wins, unproven, grafted FROM memories"
+                ).fetchall()
+            )
+        return standing
+    # Avoid piling up near-duplicates of the same fact. Only rows sharing a
+    # scoring token can merge, and `_candidate_rows` is what says which those
+    # are -- the rows it leaves out would every one of them have fallen
+    # through the `continue` below.
+    # `_elaborates` is the one merge path the overlap bound cannot narrow, and
+    # its own gate is the hour-wide window -- so the rows that can take it are
+    # fetched by date instead. None when the cue check is off and that path is
+    # dead altogether.
+    cue_window_from = None
+    if _CUE_CHECK:
+        cue_window_from = (
+            datetime.now() - timedelta(seconds=_ELABORATE_WINDOW_S)
+        ).isoformat(timespec="seconds")
+    existing = _candidate_rows(conn, new_tokens, cue_window_from)
     for (row_id, old, old_stamp, old_lineage,
          old_uses, old_wins, _old_held, old_grafted) in existing:
         old_tokens = _tokens(old)
@@ -1548,7 +1772,7 @@ def remember(fact: str, category: str = "fact", context: str = "") -> str:
         overlap = len(new_tokens & old_tokens) / max(len(new_tokens | old_tokens), 1)
         # The second arm is the corrective rewrite: a cue-poor fact being said
         # properly clears containment but not the ratio. See `_elaborates`.
-        elaborated = _elaborates(new_tokens, old, old_stamp)
+        elaborated = _elaborates(new_tokens, old, old_stamp, old_tokens)
         # ...and the third is the same agent restating its own claim in fewer
         # words. Gated on kinship, not on words alone: containment is only
         # evidence of one claim when one hand wrote both, and two hands writing
@@ -1617,8 +1841,10 @@ def remember(fact: str, category: str = "fact", context: str = "") -> str:
         # Both sides have to be known before this can fire.
         new_tree, old_tree = _tree_of(new_lineage), _tree_of(old_lineage)
         demoted = False
-        if _PROVENANCE and kin == "grove" and new_tree in standing and old_tree in standing:
-            demoted = standing[new_tree] + _TREE_MARGIN < standing[old_tree]
+        if _PROVENANCE and kin == "grove":
+            standings = _tree_standing()
+            if new_tree in standings and old_tree in standings:
+                demoted = standings[new_tree] + _TREE_MARGIN < standings[old_tree]
         sets = "fact = ?, category = ?, created_at = ?"
         args: list[Any] = [fact, category, stamp]
         if context:
@@ -1645,6 +1871,7 @@ def remember(fact: str, category: str = "fact", context: str = "") -> str:
             args.append(_graft_record(old_grafted, old_tree, old_uses, old_wins))
         args.append(row_id)
         conn.execute(f"UPDATE memories SET {sets} WHERE id = ?", tuple(args))
+        _index_tokens(conn, row_id, fact)
         conn.commit()
         conn.close()
         palace.mirror_fact(row_id, category, fact, stamp)
@@ -1680,8 +1907,9 @@ def remember(fact: str, category: str = "fact", context: str = "") -> str:
         "VALUES (?,?,?,?,?,?)",
         (category, fact, context, stamp, auto_folder(fact, category), new_lineage),
     )
-    conn.commit()
     new_id = cur.lastrowid
+    _index_tokens(conn, new_id, fact)
+    conn.commit()
     conn.close()
     palace.mirror_fact(new_id, category, fact, stamp)
     _corpus_changed()
@@ -2041,6 +2269,7 @@ def forget(id: int) -> str:
         conn.close()
         return f"ERROR: no memory with id {id}."
     conn.execute("DELETE FROM memories WHERE id = ?", (int(id),))
+    conn.execute("DELETE FROM fact_tokens WHERE mem_id = ?", (int(id),))
     conn.commit()
     conn.close()
     palace.remove_fact(int(id))
@@ -2361,6 +2590,7 @@ def delete_memory(mem_id: int) -> bool:
             conn.close()
             return False
         conn.execute("DELETE FROM memories WHERE id = ?", (int(mem_id),))
+        conn.execute("DELETE FROM fact_tokens WHERE mem_id = ?", (int(mem_id),))
         conn.commit()
         conn.close()
     except (sqlite3.Error, TypeError, ValueError):

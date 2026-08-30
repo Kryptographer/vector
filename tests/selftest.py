@@ -424,6 +424,129 @@ def t_tools_gated(work: Path) -> None:
 
 
 # ====================================================================== dbsafe
+@case("the dedup narrowing reaches every row a full scan would have")
+def t_dedup_narrowing_is_exact(work: Path) -> None:
+    """The invariant the token index rests on.
+
+    `remember` no longer compares an incoming fact against every stored one;
+    it asks `_candidate_rows` which rows could possibly merge and compares
+    against those. That is only safe while the narrowed set contains every row
+    the unrestricted scan would have merged into, so this asserts it directly:
+    for each write, the row the narrowed loop picks is the row a full table
+    scan picks. Remove the bound and this fails on the first fact that merges.
+    """
+    fresh(work)
+    facts = [
+        "Dave runs the training scripts on the RTX 4090",
+        "Dave runs the training scripts on the RTX 4090 workstation",
+        "Priya approves every production deploy",
+        "The billing API is written in Go",
+        "he prefers dark mode",
+        "Dave prefers dark mode in every editor",
+        "Priya approves each production deploy",
+    ]
+    for text in facts:
+        conn = memory._connect()
+        toks = memory._tokens(text)
+        window = (datetime.now() - timedelta(seconds=memory._ELABORATE_WINDOW_S)
+                  ).isoformat(timespec="seconds") if memory._CUE_CHECK else None
+        narrowed = memory._candidate_rows(conn, toks, window)
+        every = conn.execute(
+            "SELECT id, fact, created_at, lineage, uses, wins, unproven, grafted "
+            "FROM memories ORDER BY id").fetchall()
+        conn.close()
+
+        def merges_into(rows: list) -> Any:
+            for (rid, old, stamp, lineage, _u, _w, _h, _g) in rows:
+                old_tokens = memory._tokens(old)
+                if not old_tokens or not toks:
+                    continue
+                if len(toks & old_tokens) / max(len(toks | old_tokens), 1) > 0.75:
+                    return rid
+                if memory._elaborates(toks, old, stamp, old_tokens):
+                    return rid
+                kin = memory._kin(memory._lineage(), lineage) if memory._PROVENANCE else ""
+                if kin in ("stem", "branch") and memory._restates(toks, old_tokens):
+                    return rid
+            return None
+
+        narrow, whole = merges_into(narrowed), merges_into(every)
+        assert narrow == whole, (
+            f"{text!r}: narrowed merges into {narrow}, a full scan into {whole}")
+        memory.remember(text)
+
+
+@case("...and the token index tracks a fact through a rewrite and a delete")
+def t_token_index_tracks(work: Path) -> None:
+    """Derived data that drifts is worse than none.
+
+    The index is only exact while it says what the `memories` table says, so
+    the two writes that can put it out of step are checked here: a merge that
+    replaces a row's text, and a delete.
+    """
+    fresh(work)
+    memory.remember("Dave prefers dark mode in every editor and terminal")
+    conn = memory._connect()
+    rid, count = conn.execute(
+        "SELECT id, token_count FROM memories").fetchone()
+    stored = {t for (t,) in conn.execute(
+        "SELECT token FROM fact_tokens WHERE mem_id = ?", (rid,))}
+    conn.close()
+    assert stored == memory._tokens(
+        "Dave prefers dark mode in every editor and terminal"), stored
+    assert count == len(stored), f"token_count {count} != {len(stored)} rows"
+
+    # A merge rewrites the row's text; the index has to follow it.
+    memory.remember("Dave prefers dark mode in every editor and terminal window")
+    assert memory.count() == 1, "expected the merge, not a second row"
+    conn = memory._connect()
+    rid, count = conn.execute("SELECT id, token_count FROM memories").fetchone()
+    stored = {t for (t,) in conn.execute(
+        "SELECT token FROM fact_tokens WHERE mem_id = ?", (rid,))}
+    live = {f for (f,) in conn.execute("SELECT fact FROM memories")}
+    conn.close()
+    assert stored == memory._tokens(live.pop()), "index kept the pre-merge tokens"
+    assert count == len(stored), f"token_count {count} != {len(stored)} rows"
+
+    # ...and a delete takes them with it, or the next write scores a ghost.
+    memory.forget(rid)
+    conn = memory._connect()
+    left = conn.execute(
+        "SELECT COUNT(*) FROM fact_tokens WHERE mem_id = ?", (rid,)).fetchone()[0]
+    conn.close()
+    assert left == 0, f"{left} token rows outlived the fact they describe"
+
+
+@case("...and a store written before the index gets one on first open")
+def t_token_index_backfill(work: Path) -> None:
+    """An existing database must not have to be rebuilt by hand.
+
+    A store written before `fact_tokens` existed has facts and no index, and
+    the dedup pass reads the index -- so without a backfill every stored fact
+    becomes invisible to it and the next near-duplicate is appended instead of
+    merged. This builds that database by hand and checks the upgrade.
+    """
+    state = fresh(work)
+    memory.remember("Dave runs the training scripts on the RTX 4090")
+    conn = memory._connect()
+    # Drop back to the pre-index schema, facts intact.
+    conn.execute("DROP TABLE fact_tokens")
+    conn.commit()
+    conn.close()
+
+    # Re-opening the same store is what an upgrade looks like from here.
+    memory.configure(state)
+    conn = memory._connect()
+    rows = conn.execute("SELECT COUNT(*) FROM fact_tokens").fetchone()[0]
+    conn.close()
+    assert rows == len(memory._tokens(
+        "Dave runs the training scripts on the RTX 4090")), (
+        f"backfill wrote {rows} token rows")
+    memory.remember("Dave runs the training scripts on the RTX 4090 box")
+    assert memory.count() == 1, (
+        f"the restored index did not merge; {memory.count()} rows")
+
+
 @case("a corrupt database is quarantined rather than fatal")
 def t_quarantine(work: Path) -> None:
     d = Path(tempfile.mkdtemp(dir=work))
