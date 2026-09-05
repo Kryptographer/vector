@@ -93,6 +93,13 @@ print(memory.recall("who approves deploys"))
 print(memory.preload())      # the sector-agnostic facts, for your system prompt
 ```
 
+Memory also supports explicit corrections with `remember(..., replaces=id)`,
+original-evidence history via `memory_history(id)`, separate retrieval `cues`,
+and optional per-request `prime()` context for implicit requests. See
+[the memory API and research limits](docs/MEMORY.md#corrections-and-original-evidence).
+For actionable tool observations, `gate.fold(..., whole=True)` preserves the
+complete payload. All additions remain stdlib-only.
+
 ### Folding
 
 ```python
@@ -268,7 +275,7 @@ More on method and how to read the numbers: **[docs/BENCHMARKS.md](docs/BENCHMAR
 ## Testing
 
 ```bash
-python tests/selftest.py     # 33 checks, standalone, no dependencies
+python tests/selftest.py     # 48 checks, standalone, no dependencies
 pytest tests/selftest.py     # the same checks as pytest cases
 ```
 

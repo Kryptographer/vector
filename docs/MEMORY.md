@@ -1,6 +1,6 @@
 # The memory layer
 
-SQLite, one table, no embedding model. What makes it more than a notes table is
+SQLite, current facts plus revision and retrieval tables, no embedding model. What makes it more than a notes table is
 that it grades both ends: what comes back out, and what went in.
 
 ```python
@@ -16,7 +16,7 @@ memory.recall("what GPU is in the workstation")
 
 ## Storage
 
-`memories(id, category, fact, context, created_at, folder, uses, wins, last_used, unproven, lineage, grafted)`
+`memories(id, category, fact, context, created_at, folder, uses, wins, last_used, unproven, lineage, grafted, token_count, cues)`
 in `<state_dir>/memory.db`.
 
 The database is opened in WAL so readers do not block the writer, and every
@@ -38,8 +38,9 @@ fused rather than bolted on.
 
 ## Recall
 
-Weighted keyword overlap over a stop-word-filtered token set, with `id / 1e6` as
-a recency tiebreak. `_tokens` drops anything under three letters, which is worth
+Literal keyword overlap over a stop-word-filtered token set, followed by bounded
+cue overlap, sector/familiarity bonus, and row ID as separate tiebreaks. Even a
+very large ID cannot outweigh an additional literal match. `_tokens` drops anything under three letters, which is worth
 knowing because it is what the cue check exists to police.
 
 ### Scattershot — the read-side answer to encoding specificity
@@ -334,7 +335,8 @@ re-deriving it every time.
 ## Configuration
 
 `memory.configure(state_dir, cfg)` takes a plain dict. Every key has a default
-and every mechanism can be switched off.
+and optional retrieval and learning mechanisms can be switched off. Revision
+preservation is always active once the schema has migrated.
 
 | key | default | what it does |
 |---|---|---|
@@ -345,11 +347,117 @@ and every mechanism can be switched off.
 | `reinforcement` | `True` | the use/win tally |
 | `hold_unproven` | `True` | seed grading. Inert with reinforcement off, in both directions |
 | `cue_check` | `True` | the write-time referent check |
+| `proactive` | `True` | permits `prime()` when the host calls it; never runs automatically |
 | `provenance` | `True` | lineage, restatement folding, cross-tree takeover |
 | `fusion` | `"rrf"` | `"keyword_only"` disables the semantic pass entirely |
 | `preload_core` | `8` | sector-agnostic facts in the prompt digest |
 
 ---
+
+## Corrections and original evidence
+
+```python
+memory.remember("The release is planned for Friday", context="planning notes")
+release_id = memory.all_memories()[0]["id"]
+memory.remember("The release is cancelled", replaces=release_id,
+                context="updated planning notes")
+print(memory.memory_history(release_id))      # structured records
+print(memory.recall("", history_id=release_id))  # labeled historical/current text
+```
+
+`replaces` names a known fact being corrected, even when no words overlap. A
+missing or invalid ID returns an error without inserting another fact. Existing
+automatic deduplication remains available, with a narrow guard against merging
+different leading names such as Alice and Bob. This guard is not entity
+resolution: use explicit IDs for known corrections and keep independent or
+unresolved claims as separate facts.
+
+SQLite triggers archive the previous wording, context, cues, lineage, and grading
+state in the same transaction as a change. An identical save or reinforcement
+does not add a revision. Normal recall, preload, and priming read current rows;
+history requires an explicit ID and never reinforces old claims. History returns
+the latest eight records by default, oldest first and current last, capped at 50
+records per read. Older versions remain on disk. Storage time is not a fact's
+real-world validity date; `superseded_at` in structured history is UTC.
+
+Explicit wording corrections, changed numeric values, and polarity reversals
+reset earned rank and learned bonds. Replacement cues are cleared unless supplied
+again. Explicit replacement also clears old source context unless new context is
+provided. Original evidence stays in history. Exact deletion and `forget` remove
+the row's history too. There is no automatic retention limit for revisions, so
+frequently edited facts increase disk use. These revisions are an application
+history, not a tamper-proof audit log.
+
+Existing stores migrate on first open without inventing prior versions. A
+semantic hit with a live memory ID resolves to current SQLite wording; a deleted
+ID is ignored. Backends should return `None` IDs only for independent external
+knowledge, which cannot be checked against SQLite's deletion history.
+
+## Retrieval cues and optional priming
+
+```python
+memory.remember("Sarah avoids shellfish", cues="dinner restaurant allergy")
+print(memory.recall("dinner restaurant"))  # returns the original fact
+context = memory.prime("Suggest a dinner restaurant for Sarah",
+                       known=existing_prompt, limit=3, max_chars=2000)
+```
+
+Cues are caller-supplied hints about supported associations, stored separately
+from the fact. Only the first 512 input characters and at most 32 tokens are
+indexed; only three cue matches can affect a ranking. Hints never replace the
+evidence text, enter the dedup token index, or outweigh another literal fact-token
+match in the keyword ranking. `cues=None` preserves existing hints during ordinary
+rewording; `cues=""` clears them. Inspect them through `all_memories()` or history.
+Incorrect hints can still retrieve the wrong fact and require correction by the host.
+
+`prime()` gives a host a retrieval point before generation even when the user did
+not explicitly ask to remember something. Call it after setting the run identity
+and put its output in per-request context, outside the stable system prefix. It
+requires two distinct matches across fact and cues, skips held facts and exact
+facts already in `known`, and uses no sector, recency, semantic, or scatter fallback.
+It returns at most three facts by default (hard maximum eight) within 2,000
+characters by default. Facts too long to fit are skipped whole. Zero budgets,
+weak evidence, and `proactive=False` yield an empty string. Grade/discard the run
+as for recall; priming can earn use/win credit but never teaches query bonds.
+
+Priming trades coverage for a smaller context and abstention. It neither verifies
+truth nor establishes a trust boundary. The host must decide which stored material
+may enter its prompt. Keep explicit recall available for facts priming misses.
+
+## Research basis and remaining gaps
+
+These are scoped adaptations of papers in the supplied
+[Ranger research collection](https://github.com/Kryptographer/Ranger/tree/main/Arxiv%20papers),
+applied to this standalone Vector library.
+
+- [MemoryLACE](https://arxiv.org/abs/2609.03201), sections III.A–C, motivates
+  preserving atomic evidence and separating current from historical state. Vector
+  now provides revision history and explicit replacement. It does **not** implement
+  the paper's contradiction graph, relation classifier, or lifecycle expansion.
+- [When Users Don't Ask](https://arxiv.org/abs/2609.03467), sections 2 and 6,
+  motivates testing implicit requests and enriching retrieval cues while returning
+  original evidence. Hand-authored hints and `prime()` are local hypotheses, not
+  a reproduction of Memora or proof of improved model response quality.
+- [Beyond Endpoint Scores](https://arxiv.org/abs/2609.03900), sections 1–2,
+  motivates capacity and query-style sweeps. The benchmark varies result limits,
+  distractor counts, and seeds; it does not reproduce LoRA training or temporal
+  knowledge-update evaluation. See [BENCHMARKS.md](BENCHMARKS.md).
+- [Efficient GUI Agents](https://arxiv.org/abs/2609.02309) motivates retaining
+  actionable observations. The host-controlled `whole=True` folding bypass is
+  documented in [FOLDING.md](FOLDING.md); it does not measure GUI task success.
+
+The rest of the collection identifies work requiring capabilities outside this
+patch. RuleMem needs induced rules and a model-based consistency evaluator;
+SkillGLoW needs executed task-family comparisons before accepting a consolidated
+skill. APEx, DRACO, and TIGPO need policy training and trajectory/rubric data.
+Remember and Reweight needs a debate orchestrator and calibrated confidence
+evaluation. Plan Pointers studies model-sensitive verification wording; history
+labels here are not evidence of improved source-checking behavior. Lngram v2 and
+RecurTrace require model architecture/training changes, VestigeKV requires a
+specific NoPE-MLA cache, and Spruce requires learned compact embeddings and a
+two-server cryptographic protocol. None is claimed implemented by text retrieval
+or folding. Their abstracts were screened for applicability; only the four
+adaptations above informed this implementation.
 
 ## See also
 

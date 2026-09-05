@@ -44,7 +44,8 @@ try:
     print(f"   memory.db and vector.db under {state}\n")
 
     memory.remember("Dave runs the training scripts on the RTX 4090")
-    memory.remember("Production deploys need a manual approval from Priya")
+    memory.remember("Production deploys need a manual approval from Priya",
+                    cues="release checklist shipping service")
 
     # ---------------------------------------------------------------- step 2
     print("2. build the system prompt")
@@ -72,6 +73,12 @@ try:
     print("   registry.set_current_stop(<per-run event>)\n")
 
     try:
+        # Optional per-request context, after opening the run so it is graded.
+        # Keep this separate from the stable system prefix; pass context already
+        # supplied as `known` to avoid repeating it. No model recall call needed.
+        context = memory.prime("Prepare the release checklist", known=system)
+        print(f"   request context -> {context or '(no additional memory)'}\n")
+
         # ------------------------------------------------------------ step 4
         print("4. fold each tool result on its way back to the model")
         result = "\n".join(
@@ -84,6 +91,13 @@ try:
         answer = registry.dispatch("fold_stats", {"handle": handle, "column": "3",
                                                   "op": "max"})
         print(f"   model called fold_stats -> {answer.splitlines()[1]}\n")
+
+        # Host tool metadata can identify actionable UI observations. Preserve
+        # their exact references even when a snapshot exceeds the fold threshold.
+        snapshot = "\n".join(f"[ref={i}] button: item {i}" for i in range(500))
+        observation, _, _, _ = gate.fold("browser_snapshot", snapshot,
+                                         FOLD_THRESHOLD, whole=True)
+        assert observation == snapshot
 
         # And recall is an ordinary tool call too.
         served = memory.recall("who approves deploys")

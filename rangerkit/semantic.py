@@ -39,6 +39,9 @@ when the backend knows it and `None` when it does not -- a snippet whose text
 matches a stored fact is mapped back to its row anyway, and one that matches
 nothing is carried into the results as loose text. That is deliberate: a
 retriever holding knowledge the fact table does not is still allowed to answer.
+An explicit ID that no longer exists is ignored, and a live ID always resolves
+to its current SQLite wording. Return None only for independent knowledge;
+using it for a stale mirror defeats deletion and revision semantics.
 
 SQLite remains the source of truth in every configuration. Ids, `forget`, and
 exact-delete semantics stay where they are, so a backend that is uninstalled,

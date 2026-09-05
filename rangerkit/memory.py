@@ -42,6 +42,13 @@ _RRF_K = 60
 _MIN_SCORE = 0.0
 _RECALL_LIMIT = 8
 
+# These are stored observations, not an inferred timeline of real-world truth.
+_REVISION_FIELDS = (
+    "category, fact, context, created_at, folder, uses, wins, last_used, "
+    "unproven, lineage, grafted, cues"
+)
+_PROACTIVE = True
+
 # Sector routing: narrow recall to the "brain" a request concerns, and ship
 # only sector-agnostic facts in the system prompt. Off restores the old
 # behaviour (search everything, preload the newest N).
@@ -418,6 +425,42 @@ def _prepare(conn: sqlite3.Connection) -> sqlite3.Connection:
         # and inventing one would be worse than knowing of none.
         if "grafted" not in cols:
             conn.execute("ALTER TABLE memories ADD COLUMN grafted TEXT NOT NULL DEFAULT ''")
+        if "cues" not in cols:
+            conn.execute("ALTER TABLE memories ADD COLUMN cues TEXT NOT NULL DEFAULT ''")
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS memory_revisions (
+                revision_id INTEGER PRIMARY KEY AUTOINCREMENT,
+                memory_id INTEGER NOT NULL,
+                superseded_at TEXT NOT NULL,
+                category TEXT NOT NULL, fact TEXT NOT NULL, context TEXT,
+                created_at TEXT NOT NULL, folder TEXT NOT NULL,
+                uses INTEGER NOT NULL, wins INTEGER NOT NULL, last_used TEXT NOT NULL,
+                unproven INTEGER NOT NULL, lineage TEXT NOT NULL,
+                grafted TEXT NOT NULL, cues TEXT NOT NULL
+            )
+        """)
+        conn.execute("CREATE INDEX IF NOT EXISTS idx_revisions_memory "
+                     "ON memory_revisions(memory_id, revision_id)")
+        # The archive and replacement share a transaction, including updates
+        # made outside remember(). Repeated saves and reinforcement are not revisions.
+        old_fields = ", ".join("OLD." + f.strip() for f in _REVISION_FIELDS.split(","))
+        conn.execute(f"""
+            CREATE TRIGGER IF NOT EXISTS archive_memory_revision
+            BEFORE UPDATE OF fact, category, context, cues ON memories
+            WHEN NEW.fact IS NOT OLD.fact OR NEW.category IS NOT OLD.category
+                 OR NEW.context IS NOT OLD.context OR NEW.cues IS NOT OLD.cues
+            BEGIN
+                INSERT INTO memory_revisions
+                    (memory_id, superseded_at, {_REVISION_FIELDS})
+                VALUES (OLD.id, strftime('%Y-%m-%dT%H:%M:%f', 'now'), {old_fields});
+            END
+        """)
+        conn.execute("""
+            CREATE TRIGGER IF NOT EXISTS delete_memory_revisions
+            AFTER DELETE ON memories BEGIN
+                DELETE FROM memory_revisions WHERE memory_id = OLD.id;
+            END
+        """)
         # ...and how many scoring tokens the fact itself has. Denormalised from
         # `fact_tokens` on purpose: the dedup pass has to ask whether a stored
         # fact's tokens are ALL present in an incoming one, which is a
@@ -506,6 +549,7 @@ def configure(state_dir: Path, cfg: dict[str, Any] | None = None) -> None:
     global _DB, _FUSION, _RRF_K, _MIN_SCORE, _RECALL_LIMIT, _ROUTING, _PRELOAD_CORE
     global _SCHEMA_READY, _REINFORCE, _HOLD_UNPROVEN, _CUE_CHECK, _PROVENANCE
     global _SCATTER, _SHOT_BONDS, _SHOT_NEIGHBOURS, _SHOT_BOND_MIN, _SHOT_FILL
+    global _PROACTIVE
     cfg = cfg or {}
     _DB = Path(state_dir) / "memory.db"
     _SCHEMA_READY = False  # a new state dir is a different database
@@ -523,6 +567,7 @@ def configure(state_dir: Path, cfg: dict[str, Any] | None = None) -> None:
     # nothing but the sentence. Turning the brain off is a choice about
     # learning, not a request to start writing facts that cannot be found.
     _CUE_CHECK = bool(cfg.get("cue_check", True))
+    _PROACTIVE = bool(cfg.get("proactive", True))
     # Not gated on anything either, and for a sharper version of the same
     # reason. The two grades above read a finished turn; this one reads where
     # the write came FROM, which is knowable at the moment of the write and
@@ -1680,6 +1725,21 @@ def _candidate_rows(conn: Any, new_tokens: set[str],
     return rows
 
 
+def _retrieval_cues(text: str) -> str:
+    """Bound index hints independently of the original evidence."""
+    return " ".join(sorted(_tokens(text[:512]))[:32])
+
+
+def _named_subject(text: str) -> str:
+    # A narrow guard, not entity resolution: two different leading names are
+    # evidence against an automatic merge even when all the other words match.
+    match = re.match(r"([A-Z][a-z]+)(?:['’]s)?\b", text)
+    name = match[1].lower() if match else ""
+    return "" if name in _PRONOUNS | _DEMONSTRATIVES | {
+        "the", "my", "our", "your", "a", "an",
+    } else name
+
+
 @registry.tool(
     name="remember",
     description=(
@@ -1707,15 +1767,30 @@ def _candidate_rows(conn: Any, new_tokens: set[str],
                 "type": "string",
                 "description": "One of: preference, fact, decision, context.",
             },
+            "context": {"type": "string", "description": "Source or context for this fact."},
+            "cues": {"type": "string", "description": (
+                "Optional retrieval hints, separate from the fact; at most 512 input "
+                "characters and 32 indexed tokens. Use only supported associations."
+            )},
+            "replaces": {"type": "integer", "description": (
+                "Known memory ID explicitly corrected by this fact. Preserves its "
+                "history; do not infer replacement from topical overlap alone."
+            )},
         },
         "required": ["fact"],
     },
     read_only=False,
 )
-def remember(fact: str, category: str = "fact", context: str = "") -> str:
+def remember(fact: str, category: str = "fact", context: str = "",
+             cues: str | None = None, replaces: int | None = None) -> str:
     fact = (fact or "").strip()
     if not fact:
         return "ERROR: fact cannot be empty."
+    if replaces is not None and (type(replaces) is not int or replaces <= 0):
+        return "ERROR: replaces must be a positive memory ID."
+    if cues is not None and not isinstance(cues, str):
+        return "ERROR: cues must be a string."
+    indexed_cues = _retrieval_cues(cues) if cues is not None else None
     if category not in ("preference", "fact", "decision", "context"):
         category = "fact"
 
@@ -1763,12 +1838,25 @@ def remember(fact: str, category: str = "fact", context: str = "") -> str:
         cue_window_from = (
             datetime.now() - timedelta(seconds=_ELABORATE_WINDOW_S)
         ).isoformat(timespec="seconds")
-    existing = _candidate_rows(conn, new_tokens, cue_window_from)
+    if replaces is not None:
+        existing = conn.execute(
+            "SELECT id, fact, created_at, lineage, uses, wins, unproven, grafted "
+            "FROM memories WHERE id = ?", (replaces,),
+        ).fetchall()
+        if not existing:
+            conn.close()
+            return f"ERROR: memory #{replaces} does not exist."
+    else:
+        existing = _candidate_rows(conn, new_tokens, cue_window_from)
     for (row_id, old, old_stamp, old_lineage,
          old_uses, old_wins, _old_held, old_grafted) in existing:
         old_tokens = _tokens(old)
-        if not old_tokens or not new_tokens:
-            continue
+        if replaces is None:
+            if not old_tokens or not new_tokens:
+                continue
+            old_subject, new_subject = _named_subject(old), _named_subject(fact)
+            if old_subject and new_subject and old_subject != new_subject:
+                continue
         overlap = len(new_tokens & old_tokens) / max(len(new_tokens | old_tokens), 1)
         # The second arm is the corrective rewrite: a cue-poor fact being said
         # properly clears containment but not the ratio. See `_elaborates`.
@@ -1779,9 +1867,9 @@ def remember(fact: str, category: str = "fact", context: str = "") -> str:
         # a broad fact and a narrow one are two witnesses, not a duplicate.
         kin = _kin(new_lineage, old_lineage) if _PROVENANCE else ""
         restated = kin in ("stem", "branch") and _restates(new_tokens, old_tokens)
-        if not (overlap > 0.75 or elaborated or restated):
+        if replaces is None and not (overlap > 0.75 or elaborated or restated):
             continue
-        if restated and not elaborated and overlap <= 0.75:
+        if replaces is None and restated and not elaborated and overlap <= 0.75:
             # Nothing in the newer sentence that the store does not already
             # hold, so the FULLER text stays and no row is added. This is the
             # one merge path that writes no text at all: replacing the richer
@@ -1826,6 +1914,12 @@ def remember(fact: str, category: str = "fact", context: str = "") -> str:
         # right. A re-wording that keeps its polarity keeps its tally, which
         # is what this branch was always for.
         reversed_claim = _polarity(fact) != _polarity(old)
+        # A changed amount/date can keep the same polarity. Neither it nor an
+        # explicit correction should inherit proof or question bonds for old text.
+        number_pattern = r"(?<!\w)[+-]?\d+(?:[.,:/-]\d+)*(?!\w)"
+        changed_claim = reversed_claim or (
+            re.findall(number_pattern, fact) != re.findall(number_pattern, old)
+        ) or (replaces is not None and fact != old)
         # And the second way a merge can hand over evidence it did not earn.
         # Reversal is about the CLAIM changing; this is about the TREE changing
         # under a claim that did not. When the incoming fact traces back to a
@@ -1847,11 +1941,14 @@ def remember(fact: str, category: str = "fact", context: str = "") -> str:
                 demoted = standings[new_tree] + _TREE_MARGIN < standings[old_tree]
         sets = "fact = ?, category = ?, created_at = ?"
         args: list[Any] = [fact, category, stamp]
-        if context:
+        if context or replaces is not None:
             sets += ", context = ?"
             args.append(context)
-        if reversed_claim or demoted:
+        if changed_claim or demoted:
             sets += ", uses = 0, wins = 0, last_used = ''"
+        if indexed_cues is not None or changed_claim or demoted:
+            sets += ", cues = ?"
+            args.append(indexed_cues or "")
         # The row now bears the newer sentence, so it hangs on the tree that
         # grew it. Tracking the text is the whole point -- a lineage left
         # pointing at the replaced claim's origin would make the very next
@@ -1872,28 +1969,22 @@ def remember(fact: str, category: str = "fact", context: str = "") -> str:
         args.append(row_id)
         conn.execute(f"UPDATE memories SET {sets} WHERE id = ?", tuple(args))
         _index_tokens(conn, row_id, fact)
+        if changed_claim or demoted:
+            conn.execute("DELETE FROM bonds WHERE mem_id = ?", (row_id,))
         conn.commit()
         conn.close()
         palace.mirror_fact(row_id, category, fact, stamp)
         _corpus_changed()
-        if reversed_claim or demoted:
-            # The tally resets above and the bonds have to go with it, for
-            # the same reason: they are evidence gathered about the claim
-            # this sentence now contradicts. Leaving them would hand the
-            # reversal a set of question-words proven against its opposite.
-            # A demotion owes the same debt -- the bonds were earned by the
-            # replaced fact's turns, on a tree this one does not grow on.
-            _drop_bonds(row_id)
         _plant(row_id)
-        note = " (reversed, so its earned rank starts over)" if reversed_claim else ""
-        if demoted and not reversed_claim:
+        note = " (claim changed, so its earned rank starts over)" if changed_claim else ""
+        if demoted and not changed_claim:
             # Named on the result for the same reason the reversal is: the
             # model has just replaced a fact it did not write, and an
             # indistinguishable "Updated existing memory #7" would leave it
             # believing the rank came with it.
             note = (f" (it grew on a different tree than the {old_tree} fact it "
                     f"replaced, so its earned rank starts over)")
-        if elaborated and not reversed_claim and not demoted:
+        if elaborated and not changed_claim and not demoted:
             # Say that the fix landed. The model has just been told the
             # fuller sentence would replace the vague one, and an
             # indistinguishable "Updated existing memory #7" is no evidence
@@ -1903,9 +1994,10 @@ def remember(fact: str, category: str = "fact", context: str = "") -> str:
         return f"Updated existing memory #{row_id}{note}: {fact}{_cue_note(fact)}"
 
     cur = conn.execute(
-        "INSERT INTO memories (category, fact, context, created_at, folder, lineage) "
-        "VALUES (?,?,?,?,?,?)",
-        (category, fact, context, stamp, auto_folder(fact, category), new_lineage),
+        "INSERT INTO memories (category, fact, context, created_at, folder, lineage, cues) "
+        "VALUES (?,?,?,?,?,?,?)",
+        (category, fact, context, stamp, auto_folder(fact, category), new_lineage,
+         indexed_cues or ""),
     )
     new_id = cur.lastrowid
     _index_tokens(conn, new_id, fact)
@@ -1952,6 +2044,77 @@ def _familiarity(uses: Any, wins: Any, last_used: Any) -> float:
     return _REINFORCE_WEIGHT * share * (0.5 ** (days / _REINFORCE_HALFLIFE_DAYS))
 
 
+def memory_history(mem_id: int, limit: int = 8) -> list[dict[str, Any]]:
+    """Latest revisions, oldest first and current last; at most 50 records.
+
+    A history read never reinforces old claims. The explicit read transaction
+    keeps the archive and current row consistent if another connection writes.
+    """
+    limit = min(50, max(1, int(limit)))
+    fields = [f.strip() for f in _REVISION_FIELDS.split(",")]
+    conn = _connect()
+    try:
+        conn.execute("BEGIN")
+        current = conn.execute(
+            f"SELECT {_REVISION_FIELDS} FROM memories WHERE id = ?", (mem_id,),
+        ).fetchone()
+        if current is None:
+            return []
+        archived = conn.execute(
+            f"SELECT revision_id, superseded_at, {_REVISION_FIELDS} "
+            "FROM memory_revisions WHERE memory_id = ? "
+            "ORDER BY revision_id DESC LIMIT ?", (mem_id, limit - 1),
+        ).fetchall()
+        result = [dict(zip(fields, r[2:]), memory_id=mem_id, revision_id=r[0],
+                       superseded_at=r[1], current=False) for r in reversed(archived)]
+        result.append(dict(zip(fields, current), memory_id=mem_id,
+                           revision_id=None, superseded_at=None, current=True))
+        return result
+    finally:
+        conn.close()
+
+
+def prime(request: str, known: str = "", limit: int = 3, max_chars: int = 2000) -> str:
+    """Opt-in context for a host before generation, including implicit requests.
+
+    Require two distinct literal/cue matches; no sector or recency fallback.
+    Return intact current facts within both budgets, skipping held and known
+    facts. The host remains responsible for the trust of memory it injects.
+    """
+    q = _tokens(request)
+    if not _PROACTIVE or len(q) < 2 or limit <= 0 or max_chars <= 0:
+        return ""
+    conn = _connect()
+    try:
+        rows = conn.execute(
+            "SELECT id, category, fact, cues FROM memories WHERE unproven = 0"
+        ).fetchall()
+    finally:
+        conn.close()
+    ranked = []
+    for rid, category, fact, cues in rows:
+        literal, hinted = q & _tokens(fact), q & _tokens(cues)
+        if len(literal | hinted) >= 2 and fact not in known:
+            ranked.append((len(literal), min(len(hinted), 3), rid, category, fact))
+    ranked.sort(reverse=True)
+    lines, served = [], []
+    used = 0
+    for _, _, rid, category, fact in ranked:
+        line = f"#{rid} [{category}] {fact}"
+        cost = len(line) + bool(lines)
+        if used + cost > max_chars:
+            continue  # never truncate the evidence to make it fit
+        lines.append(line)
+        served.append(rid)
+        used += cost
+        if len(lines) >= min(8, int(limit)):
+            break
+    if _REINFORCE and served:
+        with _served_lock:
+            _served.setdefault(_run_key(), set()).update(served)
+    return "\n".join(lines)
+
+
 @registry.tool(
     name="recall",
     description=(
@@ -1963,14 +2126,30 @@ def _familiarity(uses: Any, wins: Any, last_used: Any) -> float:
         "properties": {
             "query": {"type": "string", "description": "Keywords to search for."},
             "limit": {"type": "integer", "description": "Max results. Default 8."},
+            "history_id": {"type": "integer", "description": (
+                "Optional memory ID whose prior wording is explicitly needed. "
+                "Returns labeled history (max 50 records) instead of a topic search."
+            )},
         },
         "required": ["query"],
     },
 )
-def recall(query: str, limit: int = 0) -> str:
+def recall(query: str, limit: int = 0, history_id: int = 0) -> str:
+    if history_id:
+        history = memory_history(history_id, limit or 8)
+        if not history:
+            return f"No history for memory #{history_id}."
+        lines = [f"Memory #{history_id} history (storage times, not validity dates):"]
+        for revision in history:
+            status = "CURRENT" if revision["current"] else "HISTORICAL / superseded"
+            held = "; held/unproven" if revision["unproven"] else ""
+            lines.append(f"[{status}{held}] {revision['fact']} "
+                         f"(stored {revision['created_at']}; "
+                         f"source {revision['lineage'] or 'unknown'})")
+        return "\n".join(lines)
     conn = _connect()
     rows = conn.execute(
-        "SELECT id, category, fact, created_at, folder, uses, wins, last_used "
+        "SELECT id, category, fact, created_at, folder, uses, wins, last_used, cues "
         "FROM memories ORDER BY id DESC"
     ).fetchall()
     conn.close()
@@ -2009,7 +2188,8 @@ def recall(query: str, limit: int = 0) -> str:
         scored = []
         for row in pool:
             overlap = len(q & _tokens(row[2]))
-            if overlap:
+            cue_overlap = min(3, len(q & _tokens(row[8])))
+            if overlap or cue_overlap:
                 bonus = _SECTOR_BONUS if (routed and sector_of(row[4]) in routed) else 0.0
                 # Familiarity: a fact that has fed successful turns before
                 # outranks an equal match that never has. Strictly under one
@@ -2017,10 +2197,11 @@ def recall(query: str, limit: int = 0) -> str:
                 # the invariant at the constants.
                 if _REINFORCE:
                     bonus += _familiarity(row[5], row[6], row[7])
-                # Slight recency tiebreak so newer facts win equal matches.
-                scored.append((overlap + bonus + row[0] / 1e6, row[0]))
-        scored.sort(key=lambda t: t[0], reverse=True)
-        return [rid for _, rid in scored[:fetch]]
+                # Lexicographic ordering prevents hints, familiarity or large
+                # row IDs from ever outweighing another literal token match.
+                scored.append((overlap, cue_overlap, bonus, row[0]))
+        scored.sort(reverse=True)
+        return [r[-1] for r in scored[:fetch]]
 
     kw_ranked = _keyword_rank(rows)
 
@@ -2040,6 +2221,8 @@ def recall(query: str, limit: int = 0) -> str:
     if _FUSION != "keyword_only":
         try:
             for mem_id, snippet in palace.search(query, limit=fetch):
+                if mem_id is not None and mem_id not in by_id:
+                    continue  # stale mirrored IDs cannot resurrect deleted facts
                 snippet = snippet.strip()
                 if len(snippet) <= 3:
                     continue
@@ -2382,7 +2565,7 @@ def all_memories(limit: int = 500) -> list[dict[str, Any]]:
         conn = _connect()
         rows = conn.execute(
             "SELECT id, category, fact, context, created_at, folder, "
-            "uses, wins, last_used, unproven, lineage "
+            "uses, wins, last_used, unproven, lineage, cues "
             "FROM memories ORDER BY id DESC LIMIT ?",
             (int(limit),),
         ).fetchall()
@@ -2407,6 +2590,7 @@ def all_memories(limit: int = 500) -> list[dict[str, Any]]:
             # database written before lineage existed -- as "import", which is
             # the honest answer and not a guess at a writer.
             "lineage": r[10] or "",
+            "cues": r[11] or "",
             "tree": _tree_of(r[10]),
             # Empty for a fact that carries its own cues. Computed rather than
             # stored: it is a pure function of the text, so a row edited by

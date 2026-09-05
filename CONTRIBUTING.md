@@ -16,7 +16,7 @@ the rules below are what keep it that way.
 ## Running everything
 
 ```bash
-python tests/selftest.py       # 33 checks, no dependencies, under a second
+python tests/selftest.py       # 48 checks, no dependencies
 python bench/report.py         # every harness, bundled
 ```
 
