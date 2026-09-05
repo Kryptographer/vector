@@ -15,7 +15,8 @@ Or individually:
 python bench/foldsim.py --scale medium   # the fold, mechanical A/B
 python bench/memsim.py                   # the memory mechanisms, gated A/B
 python bench/recallrate.py               # an unrigged recall-rate measurement
-python tests/selftest.py                 # 33 invariant checks
+python tests/selftest.py                 # 48 invariant checks
+python bench/recallrate.py --matrix --json bench-results/recall-capacity.json
 ```
 
 ---
@@ -39,6 +40,66 @@ harness in this directory prints what it does and does not show, at the bottom o
 its own output, for that reason.
 
 ---
+
+## Retrieval across capacity and query styles
+
+The optional `--matrix` mode evaluates 40 original synthetic facts with explicit
+and implicit requests, each with 40 answerable probes and five unanswerable
+controls. It adds seeded, topically similar distractors to reach 40, 400, and
+4,000 stored rows. Every distractor belongs to an archived fictional profile;
+this deliberately stresses missing subject disambiguation. The fixture is loaded
+directly into SQLite with its token index maintained; this does not time ingestion.
+
+```bash
+python bench/recallrate.py --matrix --sizes 40 400 4000 --seeds 0 1 2 \
+    --json bench-results/recall-capacity.json
+```
+
+Six arms: plain recall at limits 4, 8, and 12; scatter at 8; cues at 8; and
+priming with cues at 3 and a 2,000-character budget. Plain recall retains the
+existing sector fallback. Cues and scatter are separate ablations. Priming is a
+different admission policy and is not a capacity-matched recall improvement.
+The JSON preserves every query, expected/returned IDs, and output characters,
+including abstention messages. Failures of capacity assertions fail the process;
+poor measured hit rates remain visible results, not silently omitted failures.
+
+Measured on Python 3.14.6, Windows, 2026-09-05. Each cell below combines three
+seeds: hit counts are out of 120 answerable probes; characters are mean total
+output over all 45 queries per seed, including controls.
+
+| store | style | plain @8 hits | cues @8 hits | plain chars | cues chars |
+|---:|---|---:|---:|---:|---:|
+| 40 | explicit | 93/120 | 108/120 | 5,388 | 5,547 |
+| 40 | implicit | 108/120 | 114/120 | 5,578 | 5,686 |
+| 400 | explicit | 32/120 | 58/120 | 36,111 | 35,073 |
+| 400 | implicit | 37/120 | 62/120 | 37,248 | 36,021 |
+| 4,000 | explicit | 9/120 | 36/120 | 37,941 | 36,627 |
+| 4,000 | implicit | 12/120 | 42/120 | 39,375 | 37,875 |
+
+The larger baseline matters: at 400 rows, plain recall at 12 returns the answer
+on 62/120 explicit and 75/120 implicit probes, exceeding cues at 8 while costing
+49,279 and 49,710 characters. At 4,000 rows, that extra capacity no longer helps.
+Scatter at 8 yields 31/120 and 36/120 hits at 400 rows, slightly below the plain
+arm because filling an empty result can replace its last-resort sector fallback.
+Cues improve these fixtures without resolving the core ambiguity.
+
+Priming at 40 rows retrieves 81/120 implicit gold facts using 1,807 characters
+per seed; at 4,000 rows it retrieves 33/120 using 6,413. It returns nothing on
+the five negative controls in either style at every size. Those few controls
+do not establish general precision: priming can return another profile's record
+on an answerable query. Ordinary recall still returns something on 1/5 explicit
+and 2/5 implicit controls per seed.
+
+The query styles and hints were hand-authored with knowledge of the facts. At
+40 rows the seeds repeat the same store; they are not independent evidence.
+These are stress fixtures, not a held-out population. In particular, their
+implicit questions are easier than their explicit questions in several arms;
+they do not reproduce the distribution in *When Users Don't Ask*. No response
+quality, production latency, confidence interval, or universal quality gain is
+claimed. Entity-scoped retrieval, unresolved contradictions, temporal streams,
+and end-to-end model evaluation remain open work. The protocol is inspired by
+[Beyond Endpoint Scores](https://arxiv.org/abs/2609.03900) and
+[When Users Don't Ask](https://arxiv.org/abs/2609.03467).
 
 ## The fold
 

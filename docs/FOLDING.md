@@ -228,6 +228,25 @@ If you have your own tool registry, `rangerkit.registry` is small and
 self-contained; `gate.peek`, `gate.grep` and `gate.stats` are plain functions and
 can be wrapped in whatever schema format you already use.
 
+### Preserve actionable observations
+
+```python
+to_model, removed, handle, structure_tokens = gate.fold(
+    "browser_snapshot", snapshot, threshold=2000, whole=True,
+)
+assert to_model == snapshot and removed == 0 and handle == ""
+```
+
+Set `whole=True` when the host knows a tool result is an actionable observation
+whose element references or coordinates must remain available. The bypass returns
+the original text without writing a ledger blob or calling a summariser. The host
+chooses this from tool metadata; Vector does not guess from names or content.
+
+This applies the observation-fidelity concern in
+[Efficient GUI Agents](https://arxiv.org/abs/2609.02309). It preserves the payload
+but pays its full context cost. It does not establish that the observation is
+current or that a GUI action will succeed.
+
 ---
 
 ## See also

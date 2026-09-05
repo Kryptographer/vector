@@ -321,14 +321,18 @@ def fold(
     tail_lines: int = 4,
     summariser: Callable[[str], str] | None = None,
     counter: Callable[[str], int] | None = None,
+    *,
+    whole: bool = False,
 ) -> tuple[str, int, str, int]:
     """Store the body locally, return (digest, chars_removed, handle, structure_tokens).
 
+    Set whole=True for actionable observations whose element references must
+    remain intact. This bypasses storage and summarisation as well as folding.
     On any failure the original text is returned untouched. A folding layer
     that can drop a tool result on a database hiccup is worse than no folding
     layer, so every path here fails open.
     """
-    if not foldable(tool, text, threshold):
+    if whole or not foldable(tool, text, threshold):
         return text, 0, "", 0
     try:
         shape = _shape(text)

@@ -4,6 +4,29 @@ All notable changes to this project are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and this project
 adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Added
+
+- Transactional revision history and explicit `remember(..., replaces=id)`
+  corrections. Original wording, source context, cues, and grading remain
+  inspectable; current retrieval excludes old revisions; deletion removes both.
+- Bounded retrieval cues stored separately from original facts and optional
+  `memory.prime()` context for implicit requests, with abstention and output limits.
+- `gate.fold(..., whole=True)` to preserve actionable observations intact.
+- Recall capacity matrix with explicit/implicit probes, seeded distractors,
+  capacity-matched baselines, output-character costs, controls and per-query JSON.
+- Twelve regression checks; 48 checks total. API examples and research scope.
+
+### Fixed
+
+- Different leading names no longer automatically merge solely through high overlap.
+- Numeric and explicit wording corrections reset proof and stale retrieval bonds/cues.
+- Large row IDs no longer overpower literal relevance; stale semantic IDs cannot
+  resurrect deleted or superseded wording.
+- The combined benchmark report now fails if its recall-rate subprocess fails.
+- Recall benchmark imports no longer run workloads; temporary stores are cleaned up.
+
 ## [1.0.0] — 2026-08-30
 
 First public release. The memory layer and the fold, extracted from Ranger and

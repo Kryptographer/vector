@@ -148,6 +148,9 @@ def main(argv: list[str] | None = None) -> int:
             "report": rr.stdout.strip().splitlines(),
         }
         print(f"{GREEN}done{RESET}" if rr.returncode == 0 else f"{RED}FAILED{RESET}")
+        if rr.returncode != 0:
+            failures.append("recall_rate")
+            results["harnesses"]["recall_rate"]["stderr"] = rr.stderr
 
     results["passed"] = not failures
     results["failures"] = failures

@@ -582,6 +582,220 @@ def t_quarantine_sidecars(work: Path) -> None:
     assert not (d / "memory.db-shm").exists()
 
 
+@case("explicit corrections retain original evidence and expose history only on request")
+def t_revision_history(work: Path) -> None:
+    fresh(work)
+    old = "The launch location is Bristol"
+    new = "Meet in Leeds next Thursday"
+    memory.remember(old, context="planning notes", cues="travel meeting")
+    rid = memory.all_memories()[0]["id"]
+    out = registry.dispatch("remember", {"fact": new, "replaces": rid})
+    assert "Updated" in out, out
+    assert memory.count() == 1
+    versions = memory.memory_history(rid)
+    assert [v["fact"] for v in versions] == [old, new], versions
+    assert versions[0]["context"] == "planning notes"
+    assert versions[0]["cues"] == "meeting travel"
+    assert versions[1]["context"] == versions[1]["cues"] == ""
+    assert not versions[0]["current"] and versions[1]["current"]
+    assert old not in memory.recall("launch location Bristol")
+    history = registry.dispatch("recall", {"query": "", "history_id": rid})
+    assert old in history and new in history and "HISTORICAL" in history, history
+    memory.remember(new, replaces=rid)
+    assert len(memory.memory_history(rid)) == 2, "identical saves created revisions"
+
+
+@case("invalid explicit replacements never insert or overwrite another fact")
+def t_revision_target(work: Path) -> None:
+    fresh(work)
+    memory.remember("Dave uses the blue trackball")
+    for target in (0, -1, True, "1", 900):
+        assert memory.remember("Dave uses the blue trackball", replaces=target).startswith("ERROR")
+    assert memory.count() == 1
+    assert len(memory.memory_history(1)) == 1
+
+
+@case("revision history rolls back with edits and disappears with exact deletion")
+def t_revision_atomic_delete(work: Path) -> None:
+    fresh(work)
+    memory.remember("The release is scheduled for Friday")
+    conn = memory._connect()
+    try:
+        conn.execute("UPDATE memories SET fact = 'An uncommitted correction' WHERE id = 1")
+        assert conn.execute("SELECT COUNT(*) FROM memory_revisions").fetchone()[0] == 1
+        conn.rollback()
+    finally:
+        conn.close()
+    assert len(memory.memory_history(1)) == 1
+    memory.remember("The release is cancelled", replaces=1)
+    assert memory.delete_memory(1)
+    assert memory.memory_history(1) == []
+    conn = memory._connect()
+    try:
+        assert conn.execute("SELECT COUNT(*) FROM memory_revisions").fetchone()[0] == 0
+        assert conn.execute("SELECT COUNT(*) FROM fact_tokens").fetchone()[0] == 0
+    finally:
+        conn.close()
+
+
+@case("old stores acquire cues and bounded revision history without inventing a past")
+def t_revision_migration(work: Path) -> None:
+    state = Path(tempfile.mkdtemp(dir=work))
+    conn = sqlite3.connect(state / "memory.db")
+    try:
+        conn.execute("CREATE TABLE memories (id INTEGER PRIMARY KEY AUTOINCREMENT, "
+                     "category TEXT NOT NULL, fact TEXT NOT NULL, context TEXT, "
+                     "created_at TEXT NOT NULL)")
+        conn.execute("INSERT INTO memories VALUES (1, 'fact', 'Legacy wording', NULL, '2020-01-01')")
+        conn.commit()
+    finally:
+        conn.close()
+    memory.configure(state)
+    assert memory.all_memories()[0]["cues"] == ""
+    assert len(memory.memory_history(1)) == 1
+    for n in range(55):
+        memory.remember(f"Revision number {n}", replaces=1)
+    versions = memory.memory_history(1, 1000)
+    assert len(versions) == 50
+    assert versions[-1]["fact"] == "Revision number 54"
+    assert len(memory.memory_history(1, 1)) == 1
+    memory.configure(state)
+    assert len(memory.memory_history(1, 1000)) == 50, "history did not survive reopening"
+
+
+@case("similar facts about different leading names remain separate")
+def t_distinct_subjects(work: Path) -> None:
+    fresh(work)
+    memory.remember("Alice prefers the dark theme in every editor and terminal window")
+    memory.remember("Bob prefers the dark theme in every editor and terminal window")
+    assert memory.count() == 2, memory.all_memories()
+
+
+@case("numeric corrections reset proof, stale hints and learned bonds")
+def t_numeric_correction(work: Path) -> None:
+    fresh(work)
+    old = "The approved quarterly budget for the billing service migration is 12000 dollars"
+    memory.remember(old, cues="finance allocation")
+    conn = memory._connect()
+    try:
+        conn.execute("UPDATE memories SET uses = 10, wins = 10 WHERE id = 1")
+        conn.execute("INSERT INTO bonds VALUES ('allocation', 1, 10, '')")
+        conn.commit()
+    finally:
+        conn.close()
+    memory.remember(old.replace("12000", "15000"))
+    row = memory.all_memories()[0]
+    assert memory.count() == 1 and row["wins"] == row["uses"] == 0, row
+    assert row["cues"] == "" and memory.bond_count() == 0
+    assert memory.memory_history(1)[0]["wins"] == 10
+
+
+@case("cues improve lookup without altering fact text or overpowering literal evidence")
+def t_retrieval_cues(work: Path) -> None:
+    state = fresh(work)
+    memory.configure(state, {"scattershot": False, "fusion": "keyword_only"})
+    original = "Sarah avoids shellfish"
+    memory.remember(original, cues="dinner restaurant allergy")
+    assert original in memory.recall("dinner restaurant"), "cue-only retrieval missed"
+    assert "allergy" not in memory.recall("dinner restaurant"), "hints leaked into the fact"
+    memory.remember("Dinner restaurant bookings open Monday")
+    assert memory.recall("dinner restaurant", limit=1).startswith("#2 ")
+    memory.remember(original, cues=" ".join(f"word{n}" for n in range(200)))
+    assert len(memory.all_memories()[1]["cues"].split()) <= 32
+    assert memory.all_memories()[1]["fact"] == original
+    memory.remember(original, cues="")
+    assert memory.all_memories()[1]["cues"] == ""
+
+
+@case("large row IDs cannot outvote an additional literal token")
+def t_recency_rank_bound(work: Path) -> None:
+    state = fresh(work)
+    memory.configure(state, {"scattershot": False})
+    memory.remember("Alpha beta gamma")
+    conn = memory._connect()
+    try:
+        conn.execute("INSERT INTO memories (id, category, fact, created_at) "
+                     "VALUES (9000000, 'fact', 'Alpha delta', '2026-01-01')")
+        conn.commit()
+    finally:
+        conn.close()
+    assert memory.recall("alpha beta", limit=1).startswith("#1 ")
+
+
+@case("priming serves intact supported context within budgets and abstains on weak requests")
+def t_prime_bounds(work: Path) -> None:
+    state = fresh(work)
+    original = "Sarah avoids shellfish"
+    memory.remember(original, cues="dinner restaurant")
+    query = "Suggest a dinner restaurant"
+    out = memory.prime(query)
+    assert original in out and "dinner" not in out, out
+    assert memory.prime("restaurant") == ""
+    assert memory.prime("unrelated quantum experiment") == ""
+    assert memory.prime(query, known=out) == ""
+    assert memory.prime(query, limit=0) == ""
+    assert memory.prime(query, max_chars=len(out) - 1) == ""
+    assert memory.prime(query, max_chars=len(out)) == out
+    memory.configure(state, {"proactive": False})
+    assert memory.prime(query) == ""
+
+
+@case("priming respects held facts and participates in turn grading")
+def t_prime_grading(work: Path) -> None:
+    fresh(work)
+    registry.set_current_stop(__import__("threading").Event())
+    try:
+        memory.remember("The staging cluster reboots Sunday")
+        memory.reinforce("error")
+        assert memory.prime("staging cluster") == ""
+        memory.trust_memory(1)
+        assert "reboots" in memory.prime("staging cluster")
+        memory.reinforce("ok")
+        assert memory.all_memories()[0]["wins"] == 1
+        assert memory.bond_count() == 0, "unsolicited context taught query bonds"
+    finally:
+        registry.set_current_stop(None)
+
+
+@case("stale semantic mirrors cannot revive deleted or superseded wording")
+def t_stale_semantic(work: Path) -> None:
+    fresh(work)
+    memory.remember("The release is on Friday")
+    memory.remember("The branch is closed")
+    memory.remember("The release is cancelled", replaces=1)
+    memory.delete_memory(2)
+
+    class Backend:
+        def search(self, query: str, limit: int = 5):
+            return [(1, "The release is on Friday"), (2, "The branch is closed"),
+                    (None, "Independent external knowledge")]
+
+    semantic.register(Backend())
+    try:
+        out = memory.recall("release")
+        assert "cancelled" in out and "Independent external knowledge" in out, out
+        assert "Friday" not in out and "branch is closed" not in out, out
+    finally:
+        semantic.register(None)
+
+
+@case("actionable snapshots bypass folding, ledger writes and summarisation")
+def t_whole_observation(work: Path) -> None:
+    fresh(work)
+    snapshot = "\n".join(f"[ref={n}] button: item {n}" for n in range(500))
+    calls = []
+
+    def summariser(text: str) -> str:
+        calls.append(text)
+        return "summary"
+
+    before = ledger.stats()
+    assert gate.fold("browser_snapshot", snapshot, 100, summariser=summariser,
+                     whole=True) == (snapshot, 0, "", 0)
+    assert ledger.stats() == before
+    assert calls == [], "whole observations called a summariser"
+
+
 # ======================================================================== main
 def run() -> int:
     BOLD, DIM, GREEN, RED, RESET = "\033[1m", "\033[2m", "\033[32m", "\033[31m", "\033[0m"
